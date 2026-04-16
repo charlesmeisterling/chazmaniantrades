@@ -1,0 +1,314 @@
+#!/usr/bin/env python3
+import os
+import json
+import requests
+import time
+from datetime import datetime, timedelta, timezone
+from pathlib import Path
+
+FINNHUB_KEY  = os.environ.get('FINNHUB_API_KEY', '')
+NTFY_TOPIC   = os.environ.get('NTFY_TOPIC', '')
+TICKERS_RAW  = os.environ.get('TICKERS', 'TSLA,IVV,AMZN,AKAM,IAU,TMC,JNJ,LAC,ABEV,ADNT')
+TICKERS      = [t.strip().upper() for t in TICKERS_RAW.split(',') if t.strip()]
+SKIP_ANALYST = {'IVV','IAU','SPY','QQQ','GLD','SLV','BTC','ETH','VTI','VOO'}
+STATE_FILE   = 'alert_state.json'
+FINNHUB_BASE = 'https://finnhub.io/api/v1'
+
+def finnhub(endpoint, params={}):
+    if not FINNHUB_KEY:
+        return None
+    try:
+        p = {**params, 'token': FINNHUB_KEY}
+        r = requests.get(f'{FINNHUB_BASE}/{endpoint}', params=p, timeout=10)
+        if r.status_code == 200:
+            return r.json()
+        return None
+    except:
+        return None
+
+def load_state():
+    try:
+        if Path(STATE_FILE).exists():
+            with open(STATE_FILE) as f:
+                state = json.load(f)
+            cutoff = (datetime.now(timezone.utc) - timedelta(days=7)).isoformat()
+            return {k: v for k, v in state.items() if v.get('time','') > cutoff}
+    except:
+        pass
+    return {}
+
+def save_state(state):
+    try:
+        with open(STATE_FILE, 'w') as f:
+            json.dump(state, f, indent=2)
+    except:
+        pass
+
+def already_alerted(state, key):
+    return key in state
+
+def mark_alerted(state, key):
+    state[key] = {'time': datetime.now(timezone.utc).isoformat()}
+
+def send_notification(title, body, priority='high', tags='chart_with_upwards_trend'):
+    if not NTFY_TOPIC:
+        print(f"  [NO TOPIC] {title}")
+        return False
+    try:
+        r = requests.post(
+            f'https://ntfy.sh/{NTFY_TOPIC}',
+            data=body.encode('utf-8'),
+            headers={
+                'Title': title,
+                'Priority': priority,
+                'Tags': tags,
+                'Content-Type': 'text/plain',
+            },
+            timeout=10
+        )
+        if r.status_code == 200:
+            print(f"  SENT: {title}")
+            return True
+        else:
+            print(f"  FAILED ({r.status_code}): {title}")
+            return False
+    except Exception as e:
+        print(f"  ERROR: {e}")
+        return False
+
+def check_upgrades_downgrades(ticker, state):
+    if ticker in SKIP_ANALYST:
+        return
+    print(f"  Checking analyst actions: {ticker}")
+    data = finnhub('stock/upgrade-downgrade', {'symbol': ticker})
+    if not data or not isinstance(data, list):
+        return
+    today  = datetime.now(timezone.utc).date()
+    cutoff = today - timedelta(days=7)
+    for action in data:
+        grade_date_str = action.get('gradeDate', '')
+        firm           = action.get('company', 'Unknown Firm')
+        from_grade     = action.get('fromGrade', '')
+        to_grade       = action.get('toGrade', '')
+        action_type    = action.get('action', '').lower()
+        if not grade_date_str:
+            continue
+        try:
+            grade_date = datetime.strptime(grade_date_str, '%Y-%m-%d').date()
+        except:
+            continue
+        if grade_date < cutoff:
+            continue
+        is_upgrade   = action_type == 'upgrade' or any(w in (to_grade or '').lower() for w in ['strong buy','buy','overweight','outperform'])
+        is_downgrade = action_type == 'downgrade' or any(w in (to_grade or '').lower() for w in ['sell','underweight','underperform','strong sell'])
+        is_init      = action_type in ('init','initiated','initiate')
+        is_reit      = action_type in ('reit','reiterate','maintained','maintain')
+        if not any([is_upgrade, is_downgrade, is_init, is_reit]):
+            continue
+        if is_reit and (to_grade or '').lower() in ('hold','neutral','equal-weight','market perform'):
+            continue
+        alert_key = f"analyst_{ticker}_{firm}_{grade_date_str}_{to_grade}"
+        if already_alerted(state, alert_key):
+            continue
+        if is_upgrade:
+            emoji, priority, tags, label = '⬆️', 'high', 'green_circle,chart_with_upwards_trend', 'UPGRADE'
+        elif is_downgrade:
+            emoji, priority, tags, label = '⬇️', 'urgent', 'red_circle,chart_with_downwards_trend', 'DOWNGRADE'
+        elif is_init:
+            emoji, priority, tags, label = '🆕', 'high', 'new,chart_with_upwards_trend', 'INITIATED'
+        else:
+            continue
+        from_str = f" from {from_grade}" if from_grade else ''
+        title = f"{emoji} {label}: {ticker} — {firm}"
+        body  = (
+            f"{firm} {label.lower()} {ticker}{from_str} to {to_grade}\n"
+            f"Date: {grade_date_str}\n\n"
+            f"Open EDGE app for full analysis."
+        )
+        if grade_date == today:
+            title = f"FRESH TODAY — {title}"
+        send_notification(title, body, priority=priority, tags=tags)
+        mark_alerted(state, alert_key)
+        time.sleep(0.5)
+
+def check_price_alerts(ticker, state):
+    data = finnhub('quote', {'symbol': ticker})
+    if not data or not data.get('c'):
+        return
+    current = data['c']
+    prev    = data['pc']
+    change  = data.get('dp', 0)
+    if not prev or prev == 0:
+        return
+    abs_change = abs(change)
+    thresholds = [
+        (10, 'urgent', 'MASSIVE MOVE'),
+        (7,  'urgent', 'BIG MOVE'),
+        (5,  'high',   'STRONG MOVE'),
+    ]
+    for threshold, priority, label in thresholds:
+        if abs_change >= threshold:
+            direction = 'UP' if change > 0 else 'DOWN'
+            alert_key = f"price_{ticker}_{direction}_{abs(int(change))}pct_{datetime.now().date()}"
+            if already_alerted(state, alert_key):
+                break
+            title = f"{'🚀' if change > 0 else '📉'} {label}: {ticker} {direction} {abs(change):.1f}%"
+            body  = (
+                f"{ticker} is {direction} {abs(change):.1f}% today\n"
+                f"Current: ${current:.2f}  |  Prev Close: ${prev:.2f}\n\n"
+                f"Open EDGE app for signals and analysis."
+            )
+            tags = 'chart_with_upwards_trend' if change > 0 else 'chart_with_downwards_trend'
+            send_notification(title, body, priority=priority, tags=tags)
+            mark_alerted(state, alert_key)
+            break
+
+def check_news_alerts(ticker, state):
+    if ticker in SKIP_ANALYST:
+        return
+    today     = datetime.now(timezone.utc).date()
+    yesterday = today - timedelta(days=1)
+    data = finnhub('company-news', {
+        'symbol': ticker,
+        'from':   yesterday.isoformat(),
+        'to':     today.isoformat()
+    })
+    if not data or not isinstance(data, list):
+        return
+    upgrade_words   = ['upgrade','raises target','raises price target','initiates','outperform','overweight','strong buy','buy rating']
+    downgrade_words = ['downgrade','cuts target','lowers target','underperform','underweight','sell rating']
+    for article in data[:10]:
+        headline   = (article.get('headline') or '').strip()
+        summary    = (article.get('summary')  or '').strip()
+        article_id = str(article.get('id', hash(headline)))
+        if not headline:
+            continue
+        text_lower   = (headline + ' ' + summary).lower()
+        is_upgrade   = any(w in text_lower for w in upgrade_words)
+        is_downgrade = any(w in text_lower for w in downgrade_words)
+        if not is_upgrade and not is_downgrade:
+            continue
+        alert_key = f"news_{ticker}_{article_id}"
+        if already_alerted(state, alert_key):
+            continue
+        label  = 'BULLISH NEWS' if is_upgrade else 'BEARISH NEWS'
+        emoji  = '📰⬆️' if is_upgrade else '📰⬇️'
+        source = article.get('source', 'News')
+        title  = f"{emoji} {label}: {ticker} — {source}"
+        body   = (
+            f"{headline}\n\n"
+            f"{summary[:200] + '...' if len(summary) > 200 else summary}\n\n"
+            f"Source: {source}"
+        )
+        priority = 'high' if is_upgrade else 'high'
+        tags     = 'newspaper,green_circle' if is_upgrade else 'newspaper,red_circle'
+        send_notification(title, body, priority=priority, tags=tags)
+        mark_alerted(state, alert_key)
+        time.sleep(0.3)
+
+def check_insider_trades(ticker, state):
+    if ticker in SKIP_ANALYST:
+        return
+    data = finnhub('stock/insider-transactions', {'symbol': ticker})
+    if not data or not isinstance(data.get('data'), list):
+        return
+    today  = datetime.now(timezone.utc).date()
+    cutoff = today - timedelta(days=7)
+    for tx in data['data'][:20]:
+        tx_date  = tx.get('transactionDate', '')
+        shares   = tx.get('share', 0) or 0
+        price    = tx.get('price', 0) or 0
+        tx_code  = tx.get('transactionCode', '')
+        name     = tx.get('name', 'Insider')
+        if tx_code != 'P' or shares <= 0:
+            continue
+        try:
+            td = datetime.strptime(tx_date, '%Y-%m-%d').date()
+        except:
+            continue
+        if td < cutoff:
+            continue
+        value = shares * price
+        if value < 10000:
+            continue
+        alert_key = f"insider_{ticker}_{name}_{tx_date}_{shares}"
+        if already_alerted(state, alert_key):
+            continue
+        title = f"💼 INSIDER BUY: {ticker} — ${value:,.0f}"
+        body  = (
+            f"{name} bought {shares:,} shares of {ticker}\n"
+            f"Price: ${price:.2f}  |  Total: ${value:,.0f}\n"
+            f"Date: {tx_date}\n\n"
+            f"Insiders only buy for one reason — they think it's going up."
+        )
+        send_notification(title, body, priority='high', tags='briefcase,green_circle')
+        mark_alerted(state, alert_key)
+        time.sleep(0.3)
+
+def send_market_summary(state):
+    now_et = datetime.now(timezone.utc) - timedelta(hours=4)
+    hour, minute = now_et.hour, now_et.minute
+    is_morning = (hour == 9 and 29 <= minute <= 35)
+    is_closing = (hour == 16 and 0 <= minute <= 10)
+    if not is_morning and not is_closing:
+        return
+    session = 'morning' if is_morning else 'closing'
+    key = f"summary_{session}_{now_et.date()}"
+    if already_alerted(state, key):
+        return
+    movers_up, movers_down = [], []
+    for ticker in TICKERS[:8]:
+        data = finnhub('quote', {'symbol': ticker})
+        if data and data.get('c') and data.get('dp') is not None:
+            change = data['dp']
+            if change >= 3:
+                movers_up.append(f"{ticker} +{change:.1f}%")
+            elif change <= -3:
+                movers_down.append(f"{ticker} {change:.1f}%")
+        time.sleep(0.2)
+    if is_morning:
+        title = "🌅 EDGE Morning Brief — Market Open"
+        lines = ["Market is now open!\n"]
+    else:
+        title = "🔔 EDGE Closing Brief — Market Closed"
+        lines = ["Market has closed for the day.\n"]
+    if movers_up:
+        lines.append(f"📈 Gainers: {', '.join(movers_up[:3])}")
+    if movers_down:
+        lines.append(f"📉 Losers:  {', '.join(movers_down[:3])}")
+    lines.append("\nOpen EDGE app for full analysis.")
+    send_notification(title, '\n'.join(lines), priority='default', tags='bell')
+    mark_alerted(state, key)
+
+def main():
+    now = datetime.now(timezone.utc)
+    print(f"\n{'='*50}")
+    print(f"EDGE Alert Check — {now.strftime('%Y-%m-%d %H:%M UTC')}")
+    print(f"Tickers: {', '.join(TICKERS)}")
+    print(f"Finnhub: {'SET' if FINNHUB_KEY else 'MISSING'}")
+    print(f"ntfy:    {'SET — ' + NTFY_TOPIC if NTFY_TOPIC else 'MISSING'}")
+    print(f"{'='*50}\n")
+    if not FINNHUB_KEY:
+        print("ERROR: FINNHUB_API_KEY secret not set.")
+        return
+    if not NTFY_TOPIC:
+        print("ERROR: NTFY_TOPIC secret not set.")
+        return
+    state = load_state()
+    send_market_summary(state)
+    for ticker in TICKERS:
+        print(f"\n--- {ticker} ---")
+        check_upgrades_downgrades(ticker, state)
+        time.sleep(0.3)
+        check_price_alerts(ticker, state)
+        time.sleep(0.3)
+        check_news_alerts(ticker, state)
+        time.sleep(0.3)
+        check_insider_trades(ticker, state)
+        time.sleep(0.5)
+    save_state(state)
+    print(f"\nDone. {len(state)} alerts tracked.")
+    print(f"{'='*50}\n")
+
+if __name__ == '__main__':
+    main()
